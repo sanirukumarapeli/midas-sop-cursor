@@ -7,9 +7,10 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-source-serif), ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
   --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-sans);
+  --font-heading: var(--font-source-serif), ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -122,8 +123,8 @@
     @apply border-border outline-ring/50;
   }
   body {
-    /* 🚨 FORCED DARK MODE FIX: Prevents white bleeding on edges */
-    @apply bg-slate-950 text-slate-200 antialiased;
+    /* Forced dark charcoal to match Claude-like Midason shell */
+    @apply bg-[#1a1a1a] text-zinc-200 antialiased;
   }
   html {
     @apply font-sans;

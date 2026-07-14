@@ -113,7 +113,7 @@ bedrock_client = boto3.client(
 # 2. Bypass Embeddings (API Key is exclusively scoped for Nova Lite)
 sql_intents = [item["intent"] for item in SQL_LIBRARY]
 sql_embeddings = [] 
-print("✅ SYSTEM READY: AWS Bedrock connected (Booting via Nova Lite).")
+print("[OK] SYSTEM READY: AWS Bedrock connected (Booting via Nova Lite).")
 
 def get_dynamic_sql_example(user_query: str) -> str:
     """SQL Hints disabled. Nova Lite will rely on its base training to write SQL."""
@@ -123,69 +123,227 @@ def get_dynamic_sql_example(user_query: str) -> str:
 # 2. TOOL DEFINITIONS
 # ==========================================
 # ==========================================
-# 🚨 NEW: FINAL ANSWER PYDANTIC SCHEMAS (Step 4)
+# FINAL ANSWER PYDANTIC SCHEMAS (MULTI-PANEL DASHBOARD)
 # ==========================================
 class ChartDataset(BaseModel):
     name: str
     data: List[float]
 
+class KpiMetric(BaseModel):
+    label: str = Field(..., description="Short KPI label, e.g. '2025 total' or 'Peak — Apr'")
+    value: str = Field(..., description="Pre-formatted display value, e.g. '$147.0M' or '12.3%'")
+    emphasis: Literal["neutral", "positive", "negative"] = Field(
+        "neutral",
+        description="positive=teal highlight, negative=orange/red highlight, neutral=default white"
+    )
+
 class VisualChart(BaseModel):
-    chart_type: Literal["line", "bar", "pie", "stacked_bar", "waterfall", "dual_axis"]
+    chart_type: Literal[
+        "line", "bar", "pie", "stacked_bar", "waterfall", "dual_axis",
+        "diverging_bar", "horizontal_bar"
+    ]
     title: str
-    y_axis_unit: Literal["USD", "DPs", "MIXED"]
+    y_axis_unit: Literal["USD", "DPs", "MIXED", "PERCENT"]
     x_axis: List[str]
     datasets: List[ChartDataset]
+    show_average_line: bool = Field(
+        False,
+        description="If true, UI draws a dashed average/reference line on line charts."
+    )
+    reference_value: Optional[float] = Field(
+        None,
+        description="Optional explicit reference value (e.g. monthly average). Used when show_average_line is true."
+    )
 
 class FinalAnswer(BaseModel):
     """Call this exactly once, as your final step, to deliver the answer to the user. Do not call any other tool after this."""
+    response_type: Literal["answer", "clarification"] = Field(
+        "answer",
+        description=(
+            "Use 'clarification' when the user must pick which entity they mean "
+            "(set clarification_options). Use 'answer' for normal analytical responses."
+        ),
+    )
+    clarification_options: Optional[List[str]] = Field(
+        None,
+        description="Exact selectable entity names shown as UI buttons when response_type='clarification'.",
+    )
+    clarification_field: Optional[str] = Field(
+        None,
+        description="DB column name when all options share one column (e.g. 'Customer'). Omit for cross-column ambiguity.",
+    )
     executive_summary: str = Field(..., description="1-2 concise sentences giving the direct, high-level answer.")
+    kpi_metrics: Optional[List[KpiMetric]] = Field(
+        None,
+        description="3-4 KPI cards for analytical dashboards (total, avg, peak, trough, variance). Omit for simple scalar Q&A."
+    )
+    visual_charts: Optional[List[VisualChart]] = Field(
+        None,
+        description="Primary multi-chart array (2-5 charts) for analytical trend/comparison answers. Prefer this over visual_chart."
+    )
+    visual_chart: Optional[VisualChart] = Field(
+        None,
+        description="Legacy single chart. Prefer visual_charts. UI will normalize this into a one-item array if visual_charts is empty."
+    )
     markdown_table: Optional[str] = Field(None, description="The fetched data strictly formatted as a Markdown table. Omit if not applicable.")
-    strategic_insights: Optional[str] = Field(None, description="Synthesize the data. Explain the Why and the So What. Discuss run-rates, variances, risks.")
-    recommendations: Optional[str] = Field(None, description="1-2 specific actionable business directives.")
-    visual_chart: Optional[VisualChart] = Field(None, description="Chart JSON object, or omit if no comparative data.")
+    strategic_insights: Optional[str] = Field(
+        None,
+        description=(
+            "Markdown synthesis of Why/So-What. Use a short intro, then a real numbered list "
+            "with each point on its own line (1. ... 2. ... 3. ...), blank line between points. "
+            "NEVER cram (1)(2)(3) or (a)(b)(c) into a single paragraph."
+        ),
+    )
+    recommendations: Optional[str] = Field(
+        None,
+        description=(
+            "Markdown with 2-4 actionable directives. Each directive: bold title on its own line "
+            "(**Title**), then body text, then blank line. Use bullet sub-points when listing steps. "
+            "NEVER dump ALL-CAPS labels and long paragraphs without line breaks."
+        ),
+    )
 
 @tool(args_schema=FinalAnswer)
 def final_answer(**kwargs) -> str:
     """Deliver the final structured answer to the user."""
     return "delivered"
+
+
+def normalize_final_answer_payload(payload: dict) -> dict:
+    """Ensure visual_charts is populated and capped; bridge legacy visual_chart."""
+    if not isinstance(payload, dict):
+        return payload
+
+    # Clarifications must never carry analytics panels
+    if payload.get("response_type") == "clarification":
+        payload["visual_charts"] = None
+        payload["visual_chart"] = None
+        payload["kpi_metrics"] = None
+        options = payload.get("clarification_options")
+        if isinstance(options, list):
+            payload["clarification_options"] = [str(o) for o in options if o is not None and str(o).strip()]
+        return payload
+
+    charts = payload.get("visual_charts")
+    legacy = payload.get("visual_chart")
+
+    if not charts and legacy:
+        charts = [legacy]
+    elif isinstance(charts, list) and legacy and len(charts) == 0:
+        charts = [legacy]
+
+    if isinstance(charts, list):
+        charts = charts[:5]
+        payload["visual_charts"] = charts
+
+    kpis = payload.get("kpi_metrics")
+    if isinstance(kpis, list):
+        payload["kpi_metrics"] = kpis[:4]
+
+    return payload
 # ==========================================
+
+# Clarification / exact-resolution is limited to Customer and Plant only.
+_ENTITY_DICTIONARY_COLUMNS = [
+    "Customer",
+    "Plant",
+]
+_ENTITY_MATCH_CAP = 10
+
 
 @tool
 def check_database_dictionary_tool(search_term: str) -> str:
     """
-    CRITICAL DATA DISCOVERY TOOL: Use this tool BEFORE writing SQL if you do not know which database column a specific name belongs to.
-    If a user asks about an entity like 'Work Wear Lanka', '3M', or 'Helmets', pass that exact term into this tool.
-    It will scan the database and return the exact column name (e.g., Plant, Customer, Material) where that entity exists.
+    CRITICAL ENTITY RESOLUTION TOOL for Customer and Plant names only.
+    Call this BEFORE writing SQL or ML filters when the user mentions a company or plant
+    (e.g. 'Shelby', 'Work Wear Lanka', 'Plant_PK01').
+    Returns STATUS NONE / RESOLVED / AMBIGUOUS with exact DB values. Never invent names.
+    Do NOT use this tool to disambiguate Material, Country, or Manager names.
     """
-    clean_term = search_term.lower().strip()
-    
-    # We use DuckDB directly for a lightning-fast schema scan without crashing server memory
-    sql = f"""
-    SELECT 'Customer' as DB_Column, Customer as Exact_Match_Found FROM sop_data WHERE LOWER(Customer) LIKE '%{clean_term}%' LIMIT 1
-    UNION
-    SELECT 'Plant' as DB_Column, Plant as Exact_Match_Found FROM sop_data WHERE LOWER(Plant) LIKE '%{clean_term}%' LIMIT 1
-    UNION
-    SELECT 'Material' as DB_Column, Material as Exact_Match_Found FROM sop_data WHERE LOWER(Material) LIKE '%{clean_term}%' LIMIT 1
-    UNION
-    SELECT 'Material_Group_3_MST' as DB_Column, Material_Group_3_MST as Exact_Match_Found FROM sop_data WHERE LOWER(Material_Group_3_MST) LIKE '%{clean_term}%' LIMIT 1
-    UNION
-    SELECT 'Regional_Sales_Manager' as DB_Column, Regional_Sales_Manager as Exact_Match_Found FROM sop_data WHERE LOWER(Regional_Sales_Manager) LIKE '%{clean_term}%' LIMIT 1
-    UNION
-    SELECT 'Country' as DB_Column, Country as Exact_Match_Found FROM sop_data WHERE LOWER(Country) LIKE '%{clean_term}%' LIMIT 1
-    """
-    
-    try:
-        result = execute_sql_on_db(sql)
-        
-        if not result or "0 rows" in str(result).lower() or "empty" in str(result).lower():
-             return f"No exact matches found in the DB for '{search_term}'. The user might have misspelled it."
-             
+    raw_term = (search_term or "").strip()
+    if not raw_term:
         return (
-            f"Entity categorized successfully!\n{result}\n\n"
-            f"AGENT INSTRUCTION: Look at the 'DB_Column' above. You MUST use that exact column name in your SQL WHERE clause."
+            "STATUS: NONE\n"
+            "No search term provided. Ask the user to clarify the entity name."
+        )
+
+    clean_term = raw_term.lower()
+
+    try:
+        df = _get_dataframe()
+        matches_by_col: dict[str, list[str]] = {}
+
+        for col in _ENTITY_DICTIONARY_COLUMNS:
+            if col not in df.columns:
+                continue
+            series = df[col].dropna().astype(str)
+            series = series[series.str.strip() != ""]
+            hit_mask = series.str.lower().str.contains(clean_term, regex=False, na=False)
+            uniques = sorted({v.strip() for v in series[hit_mask].tolist() if v and str(v).strip()})
+            if uniques:
+                matches_by_col[col] = uniques[:_ENTITY_MATCH_CAP]
+
+        if not matches_by_col:
+            return (
+                f"STATUS: NONE\n"
+                f"No Customer or Plant matches found for '{raw_term}'.\n"
+                "AGENT INSTRUCTION: This term is not an ambiguous Customer/Plant. "
+                "Continue with normal column mapping (Material, Country, Region, etc.) "
+                "without forcing a clarification list."
+            )
+
+        columns_hit = list(matches_by_col.keys())
+        flat_pairs = [(col, val) for col, vals in matches_by_col.items() for val in vals]
+        multi_column = len(columns_hit) > 1
+        any_col_multi = any(len(vals) > 1 for vals in matches_by_col.values())
+
+        if len(flat_pairs) == 1 and not multi_column:
+            col, val = flat_pairs[0]
+            return (
+                f"STATUS: RESOLVED\n"
+                f"DB_Column: {col}\n"
+                f"Exact_Match: {val}\n\n"
+                f"AGENT INSTRUCTION: Use exact equality only — "
+                f"WHERE LOWER({col}) = LOWER('{val.replace(chr(39), chr(39) + chr(39))}'). "
+                f"Do NOT use LIKE '%{raw_term}%' for this entity."
+            )
+
+        # AMBIGUOUS: 2+ values in one column and/or hits across multiple columns
+        use_cross_column_labels = multi_column
+        options: list[str] = []
+        for col, vals in matches_by_col.items():
+            for val in vals:
+                if use_cross_column_labels:
+                    options.append(f"{col}: {val}")
+                else:
+                    options.append(val)
+
+        numbered = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, start=1))
+        field_hint = columns_hit[0] if (not multi_column and any_col_multi) else None
+
+        field_line = f"clarification_field: {field_hint}\n" if field_hint else "clarification_field: null (cross-column)\n"
+        options_json = json.dumps(options)
+
+        return (
+            f"STATUS: AMBIGUOUS\n"
+            f"match_count: {len(options)}\n"
+            f"{field_line}"
+            f"OPTIONS_JSON: {options_json}\n"
+            f"Options:\n{numbered}\n\n"
+            "AGENT INSTRUCTION: STOP immediately. Do NOT run analytical SQL or ML tools yet. "
+            "Do NOT combine candidates with LIKE. Call `final_answer` once with:\n"
+            "  response_type='clarification'\n"
+            "  clarification_options = the exact OPTIONS_JSON list above (copy verbatim)\n"
+            f"  clarification_field = {json.dumps(field_hint)}\n"
+            "  executive_summary = a short question asking which entity the user means\n"
+            "  kpi_metrics/visual_charts/strategic_insights/recommendations = omit or null\n"
+            "After the user picks an option (button click or typed reply), parse the choice: "
+            "if it looks like 'Column: Value', use that column with exact equality on Value; "
+            "otherwise use the clarification_field / resolved column. Then continue the ORIGINAL "
+            "analytical question from chat history with LOWER(col) = LOWER('exact value')."
         )
     except Exception as e:
-         return f"Dictionary scan failed: {str(e)}"
+        return f"Dictionary scan failed: {str(e)}"
 
 @tool
 def forecast_demand_tool(year: int, target_months: list[int], customer_name: str, country_name: str, manager_name: str = "Unknown") -> str:
@@ -439,9 +597,13 @@ def query_historical_data_tool(sql_query: str) -> str:
          * "volume" / "quantity" / "DPs" -> 'Confirmed_Quantity'
          * "budget" / "target" -> 'Budget_Value' or 'Budget_Quantity'
     
-    5. BULLETPROOF FILTERING:
-       - ALWAYS use LOWER() and LIKE for ALL text searches (e.g., WHERE LOWER(Customer) LIKE '%3m%').
-       - If you are unsure which category a user's filter belongs to, use an OR fallback across the two most likely columns.
+    5. BULLETPROOF FILTERING (ENTITY RESOLUTION):
+       - RESOLVED / user-selected exact entity (from check_database_dictionary_tool or a clarification pick):
+         use exact equality — WHERE LOWER(Customer) = LOWER('Shelby Group International, Inc').
+       - Explicit "all matching" / combined partial request from the user:
+         LIKE is allowed — WHERE LOWER(Customer) LIKE '%shelby%'.
+       - Unresolved AMBIGUOUS entities: do NOT query; clarify first via final_answer clarification.
+       - If the filter looks like a Customer or Plant name and may be ambiguous, run check_database_dictionary_tool first.
        
     6. THE INVESTIGATIVE PROTOCOL:
        - If a user asks for a high-level metric, proactively execute secondary queries (like GROUP BY Calendar_Year_Month) to find contextual run-rate trends before answering.
@@ -522,9 +684,13 @@ class MidasCustomAgentExecutor:
             
             "--- CORE OPERATING PRINCIPLES ---\n"
             "1. ABSOLUTE TRUTH: Always use your DuckDB historical query tool to pull exact numbers. NEVER guess. Your only data source is the 'sop_data' table.\n"
-            "2. LOOK BEFORE YOU LEAP (DATA DISCOVERY): If the user mentions a specific proper noun (e.g., 'Work Wear Lanka', 'Shelby', 'APAC'), and you are not 100% sure which column it belongs to, you MUST use the `check_database_dictionary_tool` FIRST to determine if it is a Plant, Customer, Region, or Product before writing your SQL query.\n"
-            # --- 🚨 SURGICAL UPDATE: RULE 2 ---
-            "3. FINAL STEP RULE: Once you have gathered all data needed to answer, call the `final_answer` tool exactly once with your complete response. Never write your final answer as plain text.\n"
+            "2. LOOK BEFORE YOU LEAP (DATA DISCOVERY): If the user mentions a Customer or Plant name (e.g., 'Work Wear Lanka', 'Shelby', 'Plant_PK01'), you MUST use the `check_database_dictionary_tool` FIRST before writing SQL or calling ML tools. This tool ONLY resolves Customer and Plant — not Material, Country, or Manager.\n"
+            "2b. ENTITY DISAMBIGUATION (CRITICAL — Customer & Plant only): After `check_database_dictionary_tool`:\n"
+            "   - STATUS AMBIGUOUS: STOP. Immediately call `final_answer` with response_type='clarification', copy clarification_options from OPTIONS_JSON verbatim, set clarification_field when provided, and put a short clarifying question in executive_summary. Leave kpi_metrics/visual_charts/strategic_insights/recommendations null. Do NOT run analytical SQL. Do NOT merge candidates with LIKE '%term%'. Do NOT invent Material/Country options in the clarification list.\n"
+            "   - STATUS RESOLVED: Filter with exact equality LOWER(col) = LOWER('exact value') only.\n"
+            "   - STATUS NONE: The term is not a known Customer/Plant match — continue with normal column mapping (Material/Country/Region as appropriate) without forcing a clarification.\n"
+            "   - After the user selects an option (UI button or typed name), continue the ORIGINAL analytical question from chat history using exact equality on that choice. LIKE merges are only allowed if the user explicitly asks for all matching entities.\n"
+            "3. FINAL STEP RULE: Once you have gathered all data needed to answer (or when issuing a clarification), call the `final_answer` tool exactly once with your complete response. Never write your final answer as plain text.\n"
             "4. NO BOILERPLATE: Never use robotic phrases like 'Here is the data you requested'. Speak with executive authority.\n"
             "5. PROACTIVE INVESTIGATION (CRITICAL): If the user asks for a high-level aggregate (e.g., 'Total sales by region'), DO NOT just query the annual totals. You MUST proactively use your DuckDB tool to query the MONTHLY breakdown (GROUP BY Calendar_Year_Month) alongside the totals so you can generate a rich 'line' chart and provide deep insights on seasonality and trends.\n"
             f"6. TIMEFRAME AWARENESS: Your historical DuckDB data strictly ends in {current_anchor_year}, and you MUST default to filtering SQL queries by this year unless asked otherwise. HOWEVER, your Machine Learning tools (Demand & Risk) are explicitly designed to predict the FUTURE. You are fully authorized and expected to run forecasts for 2027, 2028, and beyond.\n"
@@ -533,34 +699,60 @@ class MidasCustomAgentExecutor:
             "   - NUMBERS: VOLUME MUST use 'DPs'. CURRENCY MUST use USD with the '$' symbol. Format all numbers >999 with commas (e.g., '13,020,605.30').\n"
             "   - TABLE HEADERS: NEVER use raw database column names with underscores in your markdown tables. Convert them to clean, human-readable titles (e.g., 'Calendar_Year_Month' MUST become 'Month', 'Total_Sales' MUST become 'Total Sales').\n"
             "   - DATES: You MUST translate raw 'YYYYMM' database formats into readable text (e.g., convert '202501' to 'January 2025') inside your tables and text.\n"
-            "   - LIST SPACING: In your 'recommendations' or any bulleted/numbered lists, you MUST separate each distinct point with a double newline (\\n\\n) to ensure proper visual spacing in the UI.\n\n"
+            "   - LIST SPACING (CRITICAL — strategic_insights AND recommendations):\n"
+            "     * Use proper Markdown lists. Each numbered/bulleted point MUST be on its own line.\n"
+            "     * Separate every list item with a blank line (\\n\\n) for UI readability.\n"
+            "     * FORBIDDEN: cramming inline markers like (1) (2) (3) or (a) (b) (c) into one dense paragraph.\n"
+            "     * strategic_insights example:\\n"
+            "       The year shows three phases:\\n\\n"
+            "       1. Strong Q1 performance driven by ...\\n\\n"
+            "       2. Mid-year volatility as ...\\n\\n"
+            "       3. Q4 collapse tied to ...\\n\\n"
+            "     * recommendations example:\\n"
+            "       **Immediate Escalation**\\n\\n"
+            "       Contact the account team to ...\\n\\n"
+            "       **Product Diversification**\\n\\n"
+            "       Hedge concentration risk by ...\\n\\n"
+            "\n"
             "9. THE DUAL-ENGINE AI LAW (CRITICAL): Your ML tools (`forecast_demand_tool`) are fully equipped with a dual-engine architecture. For MICRO-level requests (specific customers), pass their exact names. For MACRO-level requests (e.g., 'Total company sales by month in 2027'), you MUST use the ML tool and pass 'All' into the customer parameter. The backend will automatically route your request to the Top-Down Macro AI Model. DO NOT use SQL to forecast future demand.\n"
             "10. COMPLEX MATH & MACRO FORECASTING (UNIVERSAL RULE): The ML model is strictly for specific customer/country predictions. For ALL macro-level tasks (global forecasts, annual projections, quarterly variance, etc.):\n"
             "    A) Pull the required historical groupings using the DuckDB SQL tool.\n"
             "    B) DO NOT guess or silently average numbers.\n"
             "    C) You MUST use 'Chain of Thought' mathematics. Explicitly state the mathematical methodology you are choosing.\n\n"
             
-            "--- ADVANCED VISUALIZATION ENGINE (JSON) ---\n"
-            # --- 🚨 SURGICAL UPDATE: RULE 10 ---
-            "11. VISUAL ENGINE RULES (JSON INJECTION): The `visual_chart` object inside your main JSON response is MANDATORY whenever you fetch comparative data (Month-over-Month trends, Regional breakdowns, or Budget variances). NEVER skip the chart if you have comparative data, even if comparing only 2 items. If the query is a single scalar metric with no comparative data, set the `visual_chart` key to `null`.\n"
-            "   CRITICAL Y-AXIS RULE: You MUST explicitly declare a `y_axis_unit` key containing either 'USD' (for revenue/financials) or 'DPs' (for volume/quantities) based on the metric being charted.\n"
-            "   CRITICAL X-AXIS RULE: When charting monthly data, you MUST use 3-letter short forms for the `x_axis` labels (e.g., 'Jan', 'Feb', 'Mar'). NEVER use full month names. You MUST verify that no months are skipped (e.g., ensure 'Nov' is included) and the `x_axis` array length perfectly matches your `data` array length.\n"
-            "   - 'waterfall': Use ONLY to show mathematical bridges (e.g., Budget vs. Actual variance). MUST include 'Total' at the end.\n"
-            "   - 'dual_axis': Use to overlay two contrasting metrics (e.g., Volume in Bar, Net Selling Price in Line).\n"
-            "   - 'stacked_bar': Use to show product mix or composition inside larger groups.\n"
-            "   - 'line': Use for chronological trends (e.g., Month-over-Month run-rate).\n"
-            "   - 'bar': Use for direct entity rankings or group distribution.\n"
-            "   - 'pie': Use for simple percentage breakdowns.\n"
-            "   JSON STRUCTURE TEMPLATES FOR `visual_chart` (Notice the y_axis_unit injection):\n"
-            "   Waterfall: "
-            '   {"chart_type": "waterfall", "title": "Budget vs Actual Variance", "y_axis_unit": "USD", "x_axis": ["Budget", "APAC", "LATAM", "Total Actual"], "datasets": [{"name": "Variance", "data": [1000, 50, -20, 1030]}]}\n'
-            "   Dual-Axis: "
-            '   {"chart_type": "dual_axis", "title": "Volume vs Price Trend", "y_axis_unit": "MIXED", "x_axis": ["Jan", "Feb"], "datasets": [{"name": "Volume (Bar)", "data": [5000, 6000]}, {"name": "Avg Price (Line)", "data": [10.5, 12.1]}]}\n'
-            "   Stacked Bar: "
-            '   {"chart_type": "stacked_bar", "title": "Product Mix by Region", "y_axis_unit": "DPs", "x_axis": ["APAC", "LATAM"], "datasets": [{"name": "Gloves", "data": [400, 300]}, {"name": "Helmets", "data": [100, 200]}]}\n'
-            "   Line/Bar/Pie: "
-            '   {"chart_type": "line", "title": "Trend", "y_axis_unit": "DPs", "x_axis": ["Jan", "Feb"], "datasets": [{"name": "Data", "data": [10, 20]}]}\n'
-            "   CRITICAL JSON RULES: The JSON payload must be completely intact and syntactically pristine. Round all large numerical values inside the 'data' arrays to whole integers to prevent syntax crashes.\n\n"
+            "--- MULTI-PANEL DASHBOARD PROTOCOL (CRITICAL) ---\n"
+            "11. DASHBOARD RULES: For analytical queries (MoM/YoY trends, budget vs actual, regional or product mix, customer trajectories over months), "
+            "you MUST return a multi-panel dashboard — NOT a single chart.\n"
+            "   A) kpi_metrics: Emit 3–4 KPI cards derived from the data (e.g. year total, monthly avg, peak month, trough month, or variance %). "
+            "Use emphasis='positive' for peaks/growth and 'negative' for troughs/declines. Pre-format values as strings ($147.0M, 12.3%, 1.2M DPs).\n"
+            "   B) visual_charts: Emit 2–4 coordinated charts in this array (cap at 5). Prefer visual_charts over the legacy visual_chart field.\n"
+            "      Typical pack for an entity+year trajectory:\n"
+            "      - line: monthly actual vs budget and/or prior year (set show_average_line=true and reference_value to monthly avg when useful)\n"
+            "      - diverging_bar: month-on-month % change (y_axis_unit='PERCENT')\n"
+            "      - stacked_bar: regional or product contribution by month\n"
+            "      - pie: product/region mix share\n"
+            "      - horizontal_bar: ranked YoY growth by month or top entities\n"
+            "   C) Simple scalar Q&A (single total with no comparative series): omit kpi_metrics and visual_charts (leave null). Do NOT force a 5-chart dashboard.\n"
+            "   C2) Clarification responses (response_type='clarification'): NEVER attach charts, KPIs, or tables. Only executive_summary + clarification_options.\n"
+            "   D) INVESTIGATION REQUIREMENT: For entity + year style questions, fetch (1) monthly series, (2) MoM or YoY when a comparable year exists, "
+            "and (3) one breakdown (region OR product) BEFORE calling final_answer.\n"
+            "   CRITICAL Y-AXIS RULE: Every chart MUST declare y_axis_unit as 'USD', 'DPs', 'MIXED', or 'PERCENT'.\n"
+            "   CRITICAL X-AXIS RULE: Monthly labels MUST be 3-letter forms (Jan, Feb, Mar). x_axis length MUST match every datasets[].data length. Round large values to integers.\n"
+            "   Chart-type guide:\n"
+            "   - line: chronological trends / actual vs budget\n"
+            "   - diverging_bar: MoM % change around zero (green up / red down)\n"
+            "   - horizontal_bar: ranked lists or YoY % by month\n"
+            "   - stacked_bar: composition over groups\n"
+            "   - pie: share breakdown\n"
+            "   - bar: entity rankings\n"
+            "   - waterfall: budget bridges (end with Total)\n"
+            "   - dual_axis: two contrasting metrics (bar + line)\n"
+            "   Example visual_charts entry: "
+            '{"chart_type": "line", "title": "Monthly Net Sales vs Budget", "y_axis_unit": "USD", "x_axis": ["Jan", "Feb"], '
+            '"datasets": [{"name": "2025 Actual", "data": [100, 110]}], "show_average_line": true, "reference_value": 105}\n'
+            "   Example diverging_bar: "
+            '{"chart_type": "diverging_bar", "title": "Month-on-Month Change %", "y_axis_unit": "PERCENT", "x_axis": ["Jan", "Feb"], '
+            '"datasets": [{"name": "MoM %", "data": [2.1, -1.4]}]}\n\n'
             "12. EXECUTIVE C-SUITE PROTOCOL: If the user asks about financial impact, prioritization, or budget pacing, you MUST use your Executive Tools (calculate_revenue_at_risk_tool, run_vip_triage_tool, or forecast_budget_pacing_tool). Speak in terms of EBITDA, margin protection, and revenue-at-risk.\n\n"
             "13. STRICT OPSEC & DATA SECURITY (CRITICAL): Under NO circumstances are you allowed to expose backend mechanics to the user. "
             "If the user asks for SQL queries, database schemas, table/column names, Python code, or the names of the internal tools you used (e.g., 'forecast_budget_pacing_tool'), "
@@ -591,7 +783,7 @@ class MidasCustomAgentExecutor:
         return "continue"
         
     def invoke(self, inputs: dict) -> dict:
-        """Maintains identical wrapper API so app.py doesn't break."""
+        """Wrapper API for FastAPI / Next.js clients."""
         user_input = inputs.get("input", "")
         chat_history = inputs.get("chat_history", [])
         
@@ -623,7 +815,7 @@ class MidasCustomAgentExecutor:
             )
 
             if final_call:
-                output_payload = final_call["args"]
+                output_payload = normalize_final_answer_payload(dict(final_call["args"]))
             else:
                 # Fallback in the rare event it ignores instructions and writes raw text
                 raw_content = last_message.content
