@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo } from "react";
+import React, { useMemo, useSyncExternalStore } from "react";
 import {
   LineChart,
   Line,
@@ -32,6 +32,15 @@ import {
 interface DataPoint {
   name: string;
   [key: string]: string | number;
+}
+
+interface ChartLayout {
+  isNarrow: boolean;
+  yAxisWidth: number;
+  maxLabelChars: number;
+  tickFontSize: number;
+  rowHeight: number;
+  rightMargin: number;
 }
 
 const formatYAxis = (value: number, unit?: string) => {
@@ -76,7 +85,10 @@ const resolveUnit = (chartData: ChartDataPayload): string => {
     (ds) => ds.name.includes("USD") || ds.name.includes("Revenue")
   );
   const hasPctInName = chartData.datasets.some(
-    (ds) => ds.name.includes("%") || ds.name.toLowerCase().includes("mom") || ds.name.toLowerCase().includes("yoy")
+    (ds) =>
+      ds.name.includes("%") ||
+      ds.name.toLowerCase().includes("mom") ||
+      ds.name.toLowerCase().includes("yoy")
   );
 
   if (unit === "PERCENT" || hasPctInName) return "PERCENT";
@@ -84,6 +96,74 @@ const resolveUnit = (chartData: ChartDataPayload): string => {
   if (hasUSDInName) return "USD";
   return unit;
 };
+
+function subscribeViewport(onStoreChange: () => void) {
+  window.addEventListener("resize", onStoreChange);
+  return () => window.removeEventListener("resize", onStoreChange);
+}
+
+function getViewportWidth() {
+  return typeof window !== "undefined" ? window.innerWidth : 1024;
+}
+
+function useChartLayout(): ChartLayout {
+  const width = useSyncExternalStore(subscribeViewport, getViewportWidth, () => 1024);
+  const isNarrow = width < 640;
+
+  if (isNarrow) {
+    return {
+      isNarrow: true,
+      yAxisWidth: 96,
+      maxLabelChars: 13,
+      tickFontSize: 11,
+      rowHeight: 44,
+      rightMargin: 40,
+    };
+  }
+
+  return {
+    isNarrow: false,
+    yAxisWidth: width < 900 ? 140 : 168,
+    maxLabelChars: width < 900 ? 22 : 28,
+    tickFontSize: 12,
+    rowHeight: 48,
+    rightMargin: 52,
+  };
+}
+
+function truncateLabel(label: string, maxChars: number): string {
+  if (!label || label.length <= maxChars) return label;
+  if (maxChars <= 1) return "…";
+  return `${label.slice(0, maxChars - 1)}…`;
+}
+
+function TruncatedCategoryTick(props: {
+  x?: string | number;
+  y?: string | number;
+  payload?: { value?: string | number };
+  maxChars: number;
+  fontSize: number;
+}) {
+  const { x = 0, y = 0, payload, maxChars, fontSize } = props;
+  const full = String(payload?.value ?? "");
+  const display = truncateLabel(full, maxChars);
+
+  return (
+    <g transform={`translate(${Number(x)},${Number(y)})`}>
+      <text
+        x={-4}
+        y={0}
+        dy={4}
+        textAnchor="end"
+        fill="#94a3b8"
+        fontSize={fontSize}
+      >
+        <title>{full}</title>
+        {display}
+      </text>
+    </g>
+  );
+}
 
 const chartShell = (title: string, children: React.ReactNode, height = 360) => (
   <Card className="bg-zinc-900/40 border-zinc-800/80 text-white shadow-none">
@@ -105,6 +185,7 @@ const tooltipStyle = {
 };
 
 export default function SopChart({ chartData }: { chartData: ChartDataPayload | null }) {
+  const layout = useChartLayout();
   const data = useMemo(() => {
     if (!chartData) return [];
     return formatRechartsData(chartData);
@@ -116,6 +197,18 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
 
   const unit = resolveUnit(chartData);
   const colors = CHART_COLORS;
+  const maxXLabelLen = Math.max(...chartData.x_axis.map((label) => String(label).length), 0);
+  const needsAngledX =
+    layout.isNarrow || (maxXLabelLen > 14 && chartData.x_axis.length > 4);
+  const categoryXAxisProps = needsAngledX
+    ? {
+        angle: layout.isNarrow ? -35 : -25,
+        textAnchor: "end" as const,
+        height: layout.isNarrow ? 64 : 56,
+        interval: 0 as const,
+        tick: { fontSize: layout.isNarrow ? 10 : 11 },
+      }
+    : { tick: { fontSize: 12 } };
 
   // --- PIE / DONUT ---
   if (chartData.chart_type === "pie") {
@@ -163,7 +256,7 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} margin={{ left: 10, right: 10, top: 8, bottom: 8 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
-          <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+          <XAxis dataKey="name" stroke="#94a3b8" {...categoryXAxisProps} />
           <YAxis
             stroke="#94a3b8"
             tickFormatter={(value: unknown) => formatYAxis(Number(value), "PERCENT")}
@@ -197,13 +290,20 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
   // --- HORIZONTAL BAR ---
   if (chartData.chart_type === "horizontal_bar") {
     const seriesName = chartData.datasets[0].name;
+    const chartHeight = Math.max(280, data.length * layout.rowHeight + 48);
+
     return chartShell(
       chartData.title,
       <ResponsiveContainer width="100%" height="100%">
         <BarChart
           layout="vertical"
           data={data}
-          margin={{ left: 8, right: 48, top: 8, bottom: 8 }}
+          margin={{
+            left: 4,
+            right: layout.rightMargin,
+            top: 8,
+            bottom: 8,
+          }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" horizontal={false} />
           <XAxis
@@ -215,8 +315,15 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
             type="category"
             dataKey="name"
             stroke="#94a3b8"
-            width={72}
-            tick={{ fontSize: 12 }}
+            width={layout.yAxisWidth}
+            interval={0}
+            tick={(props) => (
+              <TruncatedCategoryTick
+                {...props}
+                maxChars={layout.maxLabelChars}
+                fontSize={layout.tickFontSize}
+              />
+            )}
           />
           <Tooltip
             contentStyle={tooltipStyle}
@@ -224,6 +331,7 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
               formatYAxis(Number(value), unit),
               String(name),
             ]}
+            labelFormatter={(label) => String(label)}
             cursor={{ fill: "rgba(255, 255, 255, 0.04)" }}
           />
           <Bar dataKey={seriesName} fill={POSITIVE_COLOR} radius={[0, 4, 4, 0]}>
@@ -236,7 +344,7 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
           </Bar>
         </BarChart>
       </ResponsiveContainer>,
-      Math.max(280, data.length * 36 + 40)
+      chartHeight
     );
   }
 
@@ -245,9 +353,12 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
     return chartShell(
       chartData.title,
       <ResponsiveContainer width="100%" height="100%">
-        <ComposedChart data={data} margin={{ left: 15, right: 15 }}>
+        <ComposedChart
+          data={data}
+          margin={{ left: 15, right: 15, bottom: needsAngledX ? 8 : 0 }}
+        >
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
-          <XAxis dataKey="name" stroke="#94a3b8" />
+          <XAxis dataKey="name" stroke="#94a3b8" {...categoryXAxisProps} />
           <YAxis
             yAxisId="left"
             stroke={colors[0]}
@@ -289,9 +400,9 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
     return chartShell(
       chartData.title,
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{ left: 15 }}>
+        <BarChart data={data} margin={{ left: 15, bottom: needsAngledX ? 8 : 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
-          <XAxis dataKey="name" stroke="#94a3b8" />
+          <XAxis dataKey="name" stroke="#94a3b8" {...categoryXAxisProps} />
           <YAxis
             stroke="#94a3b8"
             tickFormatter={(value: unknown) => formatYAxis(Number(value), unit)}
@@ -345,9 +456,9 @@ export default function SopChart({ chartData }: { chartData: ChartDataPayload | 
   return chartShell(
     chartData.title,
     <ResponsiveContainer width="100%" height="100%">
-      <LineChart data={data} margin={{ left: 15, right: 10 }}>
+      <LineChart data={data} margin={{ left: 15, right: 10, bottom: needsAngledX ? 8 : 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
-        <XAxis dataKey="name" stroke="#94a3b8" />
+        <XAxis dataKey="name" stroke="#94a3b8" {...categoryXAxisProps} />
         <YAxis
           stroke="#94a3b8"
           tickFormatter={(value: unknown) => formatYAxis(Number(value), unit)}

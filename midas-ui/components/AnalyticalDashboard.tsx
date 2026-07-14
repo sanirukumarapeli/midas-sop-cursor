@@ -151,14 +151,16 @@ export default function AnalyticalDashboard({
       )}
 
       {isValidContent(markdownTable) && markdownTable && (
-        <div className="overflow-x-auto rounded-xl border border-zinc-800/80 bg-zinc-900/30">
+        <div className="overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-900/30">
           <div
             className="
               w-full text-sm text-left
-              [&_table]:w-full [&_table]:border-collapse [&_table]:text-left
+              [&_table]:w-full [&_table]:table-fixed [&_table]:border-collapse [&_table]:text-left
               [&_thead]:bg-zinc-900/60 [&_thead]:border-b [&_thead]:border-zinc-700/80
-              [&_th]:px-5 [&_th]:py-4 [&_th]:font-medium [&_th]:text-zinc-300 [&_th]:whitespace-nowrap [&_th]:tracking-wide
-              [&_td]:px-5 [&_td]:py-3 [&_td]:text-zinc-400 [&_td]:border-b [&_td]:border-zinc-800/50 [&_td]:whitespace-nowrap
+              [&_th]:px-3 [&_th]:sm:px-5 [&_th]:py-3 [&_th]:sm:py-4 [&_th]:font-medium [&_th]:text-zinc-300 [&_th]:tracking-wide
+              [&_th]:whitespace-normal [&_th]:break-words [&_th]:align-top
+              [&_td]:px-3 [&_td]:sm:px-5 [&_td]:py-2.5 [&_td]:sm:py-3 [&_td]:text-zinc-400
+              [&_td]:border-b [&_td]:border-zinc-800/50 [&_td]:whitespace-normal [&_td]:break-words [&_td]:align-top
               [&_tr:hover]:bg-zinc-800/30 [&_tbody_tr:last-child_td]:border-0 transition-colors
             "
           >
