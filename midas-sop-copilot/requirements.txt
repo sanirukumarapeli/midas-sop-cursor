@@ -1,0 +1,24 @@
+streamlit
+pandas
+numpy
+xgboost
+scikit-learn
+pulp
+langchain
+# langchain-openai
+langchain_community
+python-dotenv
+joblib
+httpx
+duckdb
+shap
+plotly
+langgraph
+sqlalchemy 
+pyodbc
+rich
+fastapi
+uvicorn
+pydantic
+boto3
+langchain-aws
